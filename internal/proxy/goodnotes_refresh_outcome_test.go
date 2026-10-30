@@ -51,8 +51,8 @@ func TestGoodnotesRefreshOutcomeTypesEveryHTTPBranch(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 			}
-			switch {
-			case tc.expireAt == -1:
+			switch tc.expireAt {
+			case -1:
 				require.GreaterOrEqual(t, reply.ExpireAt, before+60)
 				require.LessOrEqual(t, reply.ExpireAt, time.Now().Unix()+60)
 			default:
