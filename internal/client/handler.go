@@ -185,6 +185,8 @@ func (h *Handler) Setup() error {
 	concurrency := cfg.Client.Concurrency
 
 	h.node.OnConnect(func(client *centrifuge.Client) {
+		// Goodnotes refresh-timing witness v1: before the SDK arms on-connect timers.
+		installRefreshTimingObserver(client)
 
 		var semaphore chan struct{}
 		if concurrency > 1 {
@@ -194,6 +196,8 @@ func (h *Handler) Setup() error {
 		client.OnRefresh(func(event centrifuge.RefreshEvent, cb centrifuge.RefreshCallback) {
 			h.runConcurrentlyIfNeeded(client.Context(), concurrency, semaphore, func() {
 				reply, extra, err := h.OnRefresh(client, event, refreshProxyHandler)
+				// Runs after cb has synchronously applied (or closed) the connection state.
+				defer emitRefreshApplied(client, reply, extra.Outcome)
 				if err != nil {
 					cb(reply, err)
 					return
@@ -229,7 +233,9 @@ func (h *Handler) Setup() error {
 
 		client.OnSubRefresh(func(event centrifuge.SubRefreshEvent, cb centrifuge.SubRefreshCallback) {
 			h.runConcurrentlyIfNeeded(client.Context(), concurrency, semaphore, func() {
-				reply, _, err := h.OnSubRefresh(client, subRefreshProxyHandler, event)
+				reply, extra, err := h.OnSubRefresh(client, subRefreshProxyHandler, event)
+				// Runs after cb has synchronously applied a renewed subscription expiration.
+				defer emitSubRefreshApplied(client, event.Channel, reply, extra.Outcome)
 				cb(reply, err)
 			})
 		})
@@ -574,6 +580,8 @@ func (h *Handler) OnClientConnecting(
 type RefreshExtra struct {
 	Subs      map[string]centrifuge.SubscribeOptions
 	CheckSubs bool
+	// Outcome is set only on the refresh proxy path (Goodnotes refresh-applied witness v1).
+	Outcome proxy.RefreshOutcome
 }
 
 func getPerCallData(c Client) proxy.PerCallData {
@@ -601,7 +609,7 @@ func (h *Handler) OnRefresh(c Client, e centrifuge.RefreshEvent, refreshProxyHan
 		if err == nil && extra.Meta != nil {
 			setStorageMeta(c, extra.Meta)
 		}
-		return r, RefreshExtra{}, err
+		return r, RefreshExtra{Outcome: extra.Outcome}, err
 	}
 	token, err := h.tokenVerifier.VerifyConnectToken(e.Token, h.cfgContainer.Config().Client.InsecureSkipTokenSignatureVerify)
 	if err != nil {
@@ -640,6 +648,8 @@ func (h *Handler) OnRPC(c Client, e centrifuge.RPCEvent, rpcProxyHandler proxy.R
 }
 
 type SubRefreshExtra struct {
+	// Outcome is set only on the sub refresh proxy path (Goodnotes refresh-applied witness v1).
+	Outcome proxy.RefreshOutcome
 }
 
 // OnSubRefresh ...
@@ -654,8 +664,8 @@ func (h *Handler) OnSubRefresh(c Client, subRefreshProxyHandler proxy.SubRefresh
 			log.Info().Str("channel", e.Channel).Str("client", c.ID()).Str("user", c.UserID()).Msg("sub refresh unknown channel")
 			return centrifuge.SubRefreshReply{}, SubRefreshExtra{}, centrifuge.ErrorUnknownChannel
 		}
-		r, _, err := subRefreshProxyHandler(c, e, chOpts, getPerCallData(c))
-		return r, SubRefreshExtra{}, err
+		r, extra, err := subRefreshProxyHandler(c, e, chOpts, getPerCallData(c))
+		return r, SubRefreshExtra{Outcome: extra.Outcome}, err
 	}
 	tokenVerifier := h.tokenVerifier
 	if h.subTokenVerifier != nil {

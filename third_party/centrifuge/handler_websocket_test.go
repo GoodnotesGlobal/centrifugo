@@ -1,0 +1,1425 @@
+package centrifuge
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/centrifugal/centrifuge/internal/websocket"
+
+	"github.com/centrifugal/protocol"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/stretchr/testify/require"
+)
+
+func TestWebsocketHandler(t *testing.T) {
+	t.Parallel()
+	n, _ := New(Config{})
+	require.NoError(t, n.Run())
+	defer func() { _ = n.Shutdown(context.Background()) }()
+	mux := http.NewServeMux()
+	mux.Handle("/connection/websocket", NewWebsocketHandler(n, WebsocketConfig{
+		UseWriteBufferPool: true,
+		CheckOrigin: func(r *http.Request) bool {
+			return true
+		},
+	}))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	dialer := &websocket.Dialer{}
+
+	url := "ws" + server.URL[4:]
+	conn, resp, _, err := dialer.Dial(url+"/connection/websocket", nil)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	require.NotNil(t, conn)
+	defer func() { _ = conn.Close() }()
+}
+
+func TestWebsocketHandlerProtocolV2(t *testing.T) {
+	t.Parallel()
+	n, _ := New(Config{})
+	require.NoError(t, n.Run())
+	defer func() { _ = n.Shutdown(context.Background()) }()
+	mux := http.NewServeMux()
+	mux.Handle("/connection/websocket", NewWebsocketHandler(n, WebsocketConfig{
+		UseWriteBufferPool: true,
+		CheckOrigin: func(r *http.Request) bool {
+			return true
+		},
+		Compression: true,
+	}))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	dialer := &websocket.Dialer{}
+	url := "ws" + server.URL[4:]
+	conn, resp, _, err := dialer.Dial(url+"/connection/websocket?cf_protocol_version=v2", nil)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	require.NotNil(t, conn)
+	defer func() { _ = conn.Close() }()
+}
+
+func TestWebsocketHandlerSubprotocol(t *testing.T) {
+	t.Parallel()
+	node := defaultNodeNoHandlers()
+	defer func() { _ = node.Shutdown(context.Background()) }()
+
+	done := make(chan struct{})
+
+	node.OnConnecting(func(ctx context.Context, event ConnectEvent) (ConnectReply, error) {
+		require.Equal(t, event.Transport.Protocol(), ProtocolTypeProtobuf)
+		close(done)
+		return ConnectReply{}, nil
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("/connection/websocket", NewWebsocketHandler(node, WebsocketConfig{}))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	dialer := &websocket.Dialer{}
+	url := "ws" + server.URL[4:]
+	dialer.Subprotocols = []string{"centrifuge-protobuf"}
+	conn, resp, _, err := dialer.Dial(url+"/connection/websocket", nil)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	require.NotNil(t, conn)
+	defer func() { _ = conn.Close() }()
+	err = conn.WriteMessage(websocket.BinaryMessage, getConnectCommandProtobuf(t))
+	require.NoError(t, err)
+	waitWithTimeout(t, done)
+}
+
+func TestWebsocketHandlerURLParams(t *testing.T) {
+	t.Parallel()
+	node := defaultNodeNoHandlers()
+	defer func() { _ = node.Shutdown(context.Background()) }()
+
+	done := make(chan struct{})
+
+	node.OnConnecting(func(ctx context.Context, event ConnectEvent) (ConnectReply, error) {
+		require.Equal(t, event.Transport.Protocol(), ProtocolTypeProtobuf)
+		require.Equal(t, event.Transport.ProtocolVersion(), ProtocolVersion2)
+		close(done)
+		return ConnectReply{}, nil
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("/connection/websocket", NewWebsocketHandler(node, WebsocketConfig{}))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	url := "ws" + server.URL[4:]
+	dialer := &websocket.Dialer{}
+
+	conn, resp, _, err := dialer.Dial(url+"/connection/websocket?cf_protocol=protobuf&cf_protocol_version=v1", nil)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	require.NotNil(t, conn)
+	defer func() { _ = conn.Close() }()
+	err = conn.WriteMessage(websocket.BinaryMessage, getConnectCommandProtobuf(t))
+	require.NoError(t, err)
+	waitWithTimeout(t, done)
+}
+
+func TestWebsocketTransportWrite(t *testing.T) {
+	t.Parallel()
+	node := defaultNodeNoHandlers()
+	defer func() { _ = node.Shutdown(context.Background()) }()
+
+	node.OnConnecting(func(ctx context.Context, event ConnectEvent) (ConnectReply, error) {
+		require.Equal(t, event.Transport.Protocol(), ProtocolTypeProtobuf)
+		transport := event.Transport.(Transport)
+		// Write to transport directly - this is only valid for tests, in normal situation
+		// we write over client methods.
+		require.NoError(t, transport.Write([]byte("hello")))
+		return ConnectReply{}, DisconnectForceNoReconnect
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("/connection/websocket", NewWebsocketHandler(node, WebsocketConfig{}))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	url := "ws" + server.URL[4:]
+	dialer := &websocket.Dialer{
+		Subprotocols: []string{"centrifuge-protobuf"},
+	}
+	conn, resp, subprotocol, err := dialer.Dial(url+"/connection/websocket", nil)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	require.NotNil(t, conn)
+	defer func() { _ = conn.Close() }()
+	err = conn.WriteMessage(websocket.BinaryMessage, getConnectCommandProtobuf(t))
+	require.NoError(t, err)
+	require.Equal(t, "centrifuge-protobuf", subprotocol)
+
+	msgType, msg, err := conn.ReadMessage()
+	require.NoError(t, err)
+	require.Equal(t, websocket.BinaryMessage, msgType)
+	l, _ := binary.Uvarint(msg[0:])
+	require.Equal(t, uint64(5), l)
+}
+
+func TestWebsocketTransportWriteMany(t *testing.T) {
+	t.Parallel()
+	node := defaultNodeNoHandlers()
+	defer func() { _ = node.Shutdown(context.Background()) }()
+
+	node.OnConnecting(func(ctx context.Context, event ConnectEvent) (ConnectReply, error) {
+		require.Equal(t, event.Transport.Protocol(), ProtocolTypeProtobuf)
+		transport := event.Transport.(Transport)
+		// Write to transport directly - this is only valid for tests, in normal situation
+		// we write over client methods.
+		require.NoError(t, transport.WriteMany([]byte("11"), []byte("2")))
+		return ConnectReply{}, DisconnectForceNoReconnect
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("/connection/websocket", NewWebsocketHandler(node, WebsocketConfig{}))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	url := "ws" + server.URL[4:]
+	dialer := &websocket.Dialer{
+		Subprotocols: []string{"centrifuge-protobuf"},
+	}
+	conn, resp, _, err := dialer.Dial(url+"/connection/websocket", nil)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	require.NotNil(t, conn)
+	defer func() { _ = conn.Close() }()
+	err = conn.WriteMessage(websocket.BinaryMessage, getConnectCommandProtobuf(t))
+	require.NoError(t, err)
+
+	msgType, msg, err := conn.ReadMessage()
+	require.NoError(t, err)
+	require.Equal(t, websocket.BinaryMessage, msgType)
+	l1, n := binary.Uvarint(msg[0:])
+	require.Equal(t, uint64(2), l1)
+	l2, _ := binary.Uvarint(msg[n+int(l1):])
+	require.Equal(t, uint64(1), l2)
+}
+
+func getConnectCommandProtobuf(t *testing.T) []byte {
+	connectRequest := &protocol.ConnectRequest{}
+	encoder := protocol.NewProtobufCommandEncoder()
+	cmd, err := encoder.Encode(&protocol.Command{
+		Id:      1,
+		Connect: connectRequest,
+	})
+	require.NoError(t, err)
+	return cmd
+}
+
+func waitWithTimeout(t *testing.T, ch chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(3 * time.Second):
+		require.Fail(t, "timeout")
+	}
+}
+
+func TestWebsocketHandlerProtobuf(t *testing.T) {
+	t.Parallel()
+	n, _ := New(Config{})
+	require.NoError(t, n.Run())
+	defer func() { _ = n.Shutdown(context.Background()) }()
+	mux := http.NewServeMux()
+	mux.Handle("/connection/websocket", NewWebsocketHandler(n, WebsocketConfig{
+		UseWriteBufferPool: true,
+		CheckOrigin: func(r *http.Request) bool {
+			return true
+		},
+	}))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	dialer := &websocket.Dialer{}
+	url := "ws" + server.URL[4:]
+	conn, resp, _, err := dialer.Dial(url+"/connection/websocket?format=protobuf", nil)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	require.NotNil(t, conn)
+	defer func() { _ = conn.Close() }()
+}
+
+func TestWebsocketHandlerPing(t *testing.T) {
+	t.Parallel()
+	n, _ := New(Config{})
+	require.NoError(t, n.Run())
+	defer func() { _ = n.Shutdown(context.Background()) }()
+	mux := http.NewServeMux()
+	mux.Handle("/connection/websocket", NewWebsocketHandler(n, WebsocketConfig{
+		PingPongConfig: PingPongConfig{
+			PingInterval: time.Second,
+		},
+	}))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	n.OnConnecting(func(ctx context.Context, event ConnectEvent) (ConnectReply, error) {
+		return ConnectReply{
+			Credentials: &Credentials{
+				UserID: "test",
+			},
+		}, nil
+	})
+
+	url := "ws" + server.URL[4:]
+
+	dialer := &websocket.Dialer{}
+	conn, resp, _, err := dialer.Dial(url+"/connection/websocket", nil)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	require.NotNil(t, conn)
+	defer func() { _ = conn.Close() }()
+
+	closeCh := make(chan struct{})
+
+	err = conn.WriteMessage(websocket.TextMessage, []byte(`{"id": 1, "connect": {}}`))
+	require.NoError(t, err)
+
+	go func() {
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				break
+			}
+			if strings.Contains(string(msg), "{}") {
+				close(closeCh)
+				break
+			}
+		}
+	}()
+
+	select {
+	case <-closeCh:
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "timeout waiting for ping")
+	}
+}
+
+func TestWebsocketHandler_FramePingPong(t *testing.T) {
+	t.Parallel()
+	defaultFramePingInterval = time.Second
+	n, _ := New(Config{})
+	require.NoError(t, n.Run())
+	defer func() { _ = n.Shutdown(context.Background()) }()
+	mux := http.NewServeMux()
+	mux.Handle("/connection/websocket", NewWebsocketHandler(n, WebsocketConfig{}))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	n.OnConnecting(func(ctx context.Context, event ConnectEvent) (ConnectReply, error) {
+		return ConnectReply{
+			Credentials: &Credentials{
+				UserID: "test",
+			},
+		}, nil
+	})
+
+	url := "ws" + server.URL[4:]
+
+	dialer := &websocket.Dialer{}
+	conn, resp, _, err := dialer.Dial(url+"/connection/websocket?cf_ws_frame_ping_pong=true", nil)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	require.NotNil(t, conn)
+	defer func() { _ = conn.Close() }()
+
+	closeCh := make(chan struct{})
+
+	conn.SetPingHandler(func(_ []byte) error {
+		close(closeCh)
+		return nil
+	})
+
+	err = conn.WriteMessage(websocket.TextMessage, []byte(`{"id": 1, "connect": {}}`))
+	require.NoError(t, err)
+
+	go func() {
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				break
+			}
+			if strings.Contains(string(msg), "{}") {
+				require.Fail(t, "unexpected app-level ping")
+			}
+		}
+	}()
+
+	select {
+	case <-closeCh:
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "timeout waiting for frame ping")
+	}
+}
+
+func TestWebsocketHandlerCustomDisconnect(t *testing.T) {
+	t.Parallel()
+	n, _ := New(Config{})
+	require.NoError(t, n.Run())
+	defer func() { _ = n.Shutdown(context.Background()) }()
+	mux := http.NewServeMux()
+	mux.Handle("/connection/websocket", NewWebsocketHandler(n, WebsocketConfig{}))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	url := "ws" + server.URL[4:]
+	dialer := &websocket.Dialer{}
+	conn, resp, _, err := dialer.Dial(url+"/connection/websocket", nil)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	var graceCh chan struct{}
+
+	n.OnConnecting(func(ctx context.Context, event ConnectEvent) (ConnectReply, error) {
+		graceCh = event.Transport.(*websocketTransport).graceCh
+		return ConnectReply{}, DisconnectInvalidToken
+	})
+
+	connectRequest := &protocol.ConnectRequest{
+		Token: "boom",
+	}
+	cmd := &protocol.Command{
+		Id:      1,
+		Connect: connectRequest,
+	}
+	cmdBytes, _ := json.Marshal(cmd)
+
+	_ = conn.WriteMessage(websocket.TextMessage, cmdBytes)
+	_, _, err = conn.ReadMessage()
+	require.Error(t, err)
+	var closeErr *websocket.CloseError
+	ok := errors.As(err, &closeErr)
+	require.True(t, ok)
+	require.Equal(t, int(DisconnectInvalidToken.Code), closeErr.Code)
+	select {
+	case <-graceCh:
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "timeout waiting for graceful close")
+	}
+}
+
+func testAuthMiddleware(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		newCtx := SetCredentials(ctx, &Credentials{
+			UserID: "test_user_id",
+		})
+		r = r.WithContext(newCtx)
+		h.ServeHTTP(w, r)
+	})
+}
+
+// TestWebsocketHandlerConcurrentConnections allows catching errors related
+// to invalid buffer pool usages.
+func TestWebsocketHandlerConcurrentConnections(t *testing.T) {
+	t.Parallel()
+	n := defaultTestNode()
+	defer func() { _ = n.Shutdown(context.Background()) }()
+	// This test stresses the buffer pool with 100 concurrent connections; the
+	// default test-init pong timeout (500ms) is too tight when -race + parallel
+	// suite contention stretches read scheduling. Disable pings/pongs entirely
+	// — they are unrelated to the buffer-pool invariant under test.
+	n.OnConnecting(func(_ context.Context, _ ConnectEvent) (ConnectReply, error) {
+		return ConnectReply{
+			PingPongConfig: &PingPongConfig{PingInterval: -1},
+		}, nil
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("/connection/websocket", testAuthMiddleware(NewWebsocketHandler(n, WebsocketConfig{
+		WriteBufferSize: 0,
+		ReadBufferSize:  0,
+	})))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	url := "ws" + server.URL[4:]
+
+	numConns := 100
+
+	var conns []*websocket.Conn
+	for i := 0; i < numConns; i++ {
+		conn := newRealConnJSON(t, "test"+strconv.Itoa(i), url, false)
+		conns = append(conns, conn)
+	}
+	defer func() {
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	}()
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < numConns; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			payload := []byte(`{"input":"test` + strconv.Itoa(i) + `"}`)
+
+			_, err := n.Publish("test"+strconv.Itoa(i), payload)
+			if err != nil {
+				require.Fail(t, err.Error())
+			}
+
+			var firstNonPingMessage []byte
+			for {
+				_, data, err := conns[i].ReadMessage()
+				if err != nil {
+					require.Fail(t, err.Error())
+				}
+				messages := bytes.Split(data, []byte("\n"))
+				for _, msg := range messages {
+					if string(msg) == "{}" {
+						continue
+					}
+					firstNonPingMessage = msg
+				}
+				if string(firstNonPingMessage) == "" {
+					continue
+				}
+				break
+			}
+
+			var rep protocol.Reply
+			err = json.Unmarshal(firstNonPingMessage, &rep)
+			require.NoError(t, err)
+
+			require.NotNil(t, rep.Push)
+			require.NotNil(t, rep.Push.Pub)
+
+			if !strings.Contains(string(rep.Push.Pub.Data), string(payload)) {
+				require.Fail(t, "where is our payload? %s %s", string(payload), string(rep.Push.Pub.Data))
+			}
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+func TestWebsocketHandlerConnectionsBroadcast(t *testing.T) {
+	t.Parallel()
+	n := defaultTestNode()
+	defer func() { _ = n.Shutdown(context.Background()) }()
+	// Same rationale as TestWebsocketHandlerConcurrentConnections: 100
+	// concurrent connections under -race stretch read scheduling past
+	// the test-init 500 ms pong timeout. The test asserts buffer-pool
+	// invariants, not ping/pong behavior, so disable pings for this run.
+	n.OnConnecting(func(_ context.Context, _ ConnectEvent) (ConnectReply, error) {
+		return ConnectReply{
+			PingPongConfig: &PingPongConfig{PingInterval: -1},
+		}, nil
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("/connection/websocket", testAuthMiddleware(NewWebsocketHandler(n, WebsocketConfig{
+		WriteBufferSize: 0,
+		ReadBufferSize:  0,
+	})))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	url := "ws" + server.URL[4:]
+
+	numConns := 100
+
+	var conns []*websocket.Conn
+	for i := 0; i < numConns; i++ {
+		conn := newRealConnJSON(t, "test", url, false)
+		conns = append(conns, conn)
+	}
+	defer func() {
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	}()
+
+	payload := []byte(`{"input":"payload"}`)
+
+	_, err := n.Publish("test", payload)
+	if err != nil {
+		require.Fail(t, err.Error())
+	}
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < numConns; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+
+			var payloadMessage []byte
+		LOOP:
+			for {
+				_, data, err := conns[i].ReadMessage()
+				if err != nil {
+					require.Fail(t, err.Error())
+				}
+				messages := bytes.Split(data, []byte("\n"))
+				for _, msg := range messages {
+					if strings.Contains(string(msg), "payload") {
+						payloadMessage = msg
+						break LOOP
+					}
+				}
+			}
+
+			var rep protocol.Reply
+			err := json.Unmarshal(payloadMessage, &rep)
+			require.NoError(t, err)
+
+			require.NotNil(t, rep.Push)
+			require.NotNil(t, rep.Push.Pub)
+
+			if !strings.Contains(string(rep.Push.Pub.Data), string(payload)) {
+				require.Fail(t, "where is our payload? %s %s", string(payload), string(rep.Push.Pub.Data))
+			}
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+func TestCheckSameHostOrigin(t *testing.T) {
+	t.Parallel()
+
+	n := defaultTestNode()
+	defer func() { _ = n.Shutdown(context.Background()) }()
+
+	testCases := []struct {
+		name    string
+		origin  string
+		url     string
+		success bool
+	}{
+		{
+			name:    "empty_origin",
+			origin:  "",
+			success: true,
+			url:     "https://example.com/websocket/connection",
+		},
+		{
+			name:    "invalid_host",
+			origin:  "invalid",
+			url:     "https://example.com/websocket/connection",
+			success: false,
+		},
+		{
+			name:    "unauthorized",
+			origin:  "https://example.com",
+			url:     "wss://example1.com/websocket/connection",
+			success: false,
+		},
+		{
+			name:    "authorized",
+			origin:  "https://example.com",
+			url:     "wss://example.com/websocket/connection",
+			success: true,
+		},
+		{
+			name:    "authorized_case_insensitive",
+			origin:  "https://examplE.com",
+			url:     "wss://example.com/websocket/connection",
+			success: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := httptest.NewRequest("GET", tc.url, nil)
+			r.Header.Set("Origin", tc.origin)
+
+			require.Equal(t, tc.success, sameHostOriginCheck(n)(r))
+		})
+	}
+}
+
+func BenchmarkWsConnect(b *testing.B) {
+	b.Skip()
+	n := defaultTestNodeBenchmark(b)
+	defer func() { _ = n.Shutdown(context.Background()) }()
+
+	n.OnConnect(func(client *Client) {})
+
+	mux := http.NewServeMux()
+	mux.Handle("/connection/websocket", testAuthMiddleware(NewWebsocketHandler(n, WebsocketConfig{
+		WriteBufferSize: 0,
+		ReadBufferSize:  0,
+	})))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	url := "ws" + server.URL[4:]
+
+	benchmarks := []struct {
+		name    string
+		getConn func(b testing.TB, url string, compression bool) *websocket.Conn
+	}{
+		{"JSON", newRealConnJSONConnect},
+		{"PB", newRealConnProtobufConnect},
+	}
+
+	for _, bm := range benchmarks {
+		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				conn := bm.getConn(b, url, false)
+				_ = conn.Close()
+			}
+		})
+	}
+}
+
+func newRealConnJSONConnect(b testing.TB, url string, compression bool) *websocket.Conn {
+	dialer := &websocket.Dialer{
+		EnableCompression: compression,
+	}
+	conn, resp, _, err := dialer.Dial(url+"/connection/websocket", nil)
+	require.NoError(b, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	cmd := &protocol.Command{
+		Id:      1,
+		Connect: &protocol.ConnectRequest{},
+	}
+	cmdBytes, _ := json.Marshal(cmd)
+
+	require.NoError(b, conn.WriteMessage(websocket.TextMessage, cmdBytes))
+	_, _, err = conn.ReadMessage()
+	require.NoError(b, err)
+	return conn
+}
+
+func newRealConnProtobufConnect(b testing.TB, url string, compression bool) *websocket.Conn {
+	dialer := &websocket.Dialer{
+		EnableCompression: compression,
+	}
+	conn, resp, _, err := dialer.Dial(url+"/connection/websocket?format=protobuf", nil)
+	require.NoError(b, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	cmd := &protocol.Command{
+		Id:      1,
+		Connect: &protocol.ConnectRequest{},
+	}
+
+	cmdBytes, _ := cmd.MarshalVT()
+
+	var buf bytes.Buffer
+	bs := make([]byte, 8)
+	n := binary.PutUvarint(bs, uint64(len(cmdBytes)))
+	buf.Write(bs[:n])
+	buf.Write(cmdBytes)
+
+	require.NoError(b, conn.WriteMessage(websocket.BinaryMessage, buf.Bytes()))
+	_, _, err = conn.ReadMessage()
+	require.NoError(b, err)
+	return conn
+}
+
+func newRealConnJSON(b testing.TB, channel string, url string, compression bool) *websocket.Conn {
+	conn := newRealConnJSONConnect(b, url, compression)
+
+	cmd := &protocol.Command{
+		Id: 2,
+		Subscribe: &protocol.SubscribeRequest{
+			Channel: channel,
+		},
+	}
+	cmdBytes, _ := json.Marshal(cmd)
+	require.NoError(b, conn.WriteMessage(websocket.TextMessage, cmdBytes))
+	_, _, err := conn.ReadMessage()
+	require.NoError(b, err)
+	return conn
+}
+
+func newRealConnProtobuf(b testing.TB, channel string, url string, compression bool) *websocket.Conn {
+	conn := newRealConnProtobufConnect(b, url, compression)
+
+	cmd := &protocol.Command{
+		Id: 2,
+		Subscribe: &protocol.SubscribeRequest{
+			Channel: channel,
+		},
+	}
+	cmdBytes, _ := cmd.MarshalVT()
+
+	var buf bytes.Buffer
+	bs := make([]byte, 8)
+	nBytes := binary.PutUvarint(bs, uint64(len(cmdBytes)))
+	buf.Write(bs[:nBytes])
+	buf.Write(cmdBytes)
+
+	_ = conn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
+	_, _, err := conn.ReadMessage()
+	require.NoError(b, err)
+	return conn
+}
+
+func BenchmarkWsPubSub(b *testing.B) {
+	n := defaultTestNodeBenchmark(b)
+	defer func() { _ = n.Shutdown(context.Background()) }()
+
+	mux := http.NewServeMux()
+	mux.Handle("/connection/websocket", testAuthMiddleware(NewWebsocketHandler(n, WebsocketConfig{
+		WriteBufferSize: 0,
+		ReadBufferSize:  0,
+	})))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	url := "ws" + server.URL[4:]
+
+	payload := []byte(`{"input": "test"}`)
+
+	benchmarks := []struct {
+		name    string
+		getConn func(b testing.TB, channel string, url string, compression bool) *websocket.Conn
+	}{
+		{"JSON", newRealConnJSON},
+		{"PB", newRealConnProtobuf},
+	}
+	for _, bm := range benchmarks {
+		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
+			conn := bm.getConn(b, "test", url, false)
+			defer func() { _ = conn.Close() }()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, err := n.Publish("test", payload)
+				if err != nil {
+					panic(err)
+				}
+				_, _, err = conn.ReadMessage()
+				if err != nil {
+					panic(err)
+				}
+			}
+		})
+	}
+}
+
+func TestWsBroadcastCompressionCache(t *testing.T) {
+	t.Parallel()
+	n := defaultTestNode()
+	defer func() { _ = n.Shutdown(context.Background()) }()
+
+	payload := []byte(`{"input": "test"}`)
+
+	tests := []struct {
+		getConn     func(b testing.TB, channel string, url string, compression bool) *websocket.Conn
+		compression bool
+		cacheSizeMB int64
+	}{
+		{newRealConnJSON, false, 0},
+		{newRealConnJSON, true, 0},
+		{newRealConnJSON, true, 50},
+	}
+
+	numConns := 10
+
+	for _, bm := range tests {
+		testName := "compress_" + fmt.Sprintf("%v", bm.compression) + "_" +
+			"cache_" + strconv.FormatInt(bm.cacheSizeMB, 10) + "MB"
+		t.Run(testName, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.Handle("/connection/websocket", testAuthMiddleware(NewWebsocketHandler(n, WebsocketConfig{
+				Compression:                         true,
+				CompressionPreparedMessageCacheSize: bm.cacheSizeMB * 1024 * 1024,
+			})))
+			server := httptest.NewServer(mux)
+			defer server.Close()
+
+			url := "ws" + server.URL[4:]
+
+			connections := make([]*websocket.Conn, 0, numConns)
+			for i := 0; i < numConns; i++ {
+				conn := bm.getConn(t, "test", url, bm.compression)
+				connections = append(connections, conn)
+			}
+			defer func() {
+				for _, conn := range connections {
+					_ = conn.Close()
+				}
+			}()
+			_, err := n.Publish("test", payload)
+			if err != nil {
+				require.NoError(t, err)
+			}
+			for _, conn := range connections {
+				_, _, err = conn.ReadMessage()
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func BenchmarkWsBroadcastCompressionCache(b *testing.B) {
+	n := defaultTestNodeBenchmark(b)
+	defer func() { _ = n.Shutdown(context.Background()) }()
+
+	// Pre-generate payloads for unique message scenarios.
+	numUniqueMessages := 100
+	payloads := make([][]byte, numUniqueMessages)
+	for i := 0; i < numUniqueMessages; i++ {
+		payloads[i] = []byte(fmt.Sprintf(`{"input": "test", "id": %d}`, i))
+	}
+
+	benchmarks := []struct {
+		name           string
+		compression    bool
+		cacheSizeMB    int64
+		uniqueMessages int // number of unique messages to cycle through
+	}{
+		{"no_compress", false, 0, 1},
+		{"compress_no_cache", true, 0, 1},
+		{"compress_cache_same_msg", true, 50, 1},
+		{"compress_cache_100_msgs", true, 50, 100},
+	}
+
+	numConns := 100
+
+	for _, bm := range benchmarks {
+		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
+
+			mux := http.NewServeMux()
+			mux.Handle("/connection/websocket", testAuthMiddleware(NewWebsocketHandler(n, WebsocketConfig{
+				Compression:                         true,
+				CompressionPreparedMessageCacheSize: bm.cacheSizeMB * 1024 * 1024,
+			})))
+			server := httptest.NewServer(mux)
+			defer server.Close()
+
+			url := "ws" + server.URL[4:]
+
+			conns := make([]*websocket.Conn, 0, numConns)
+			for i := 0; i < numConns; i++ {
+				conn := newRealConnJSON(b, "test", url, bm.compression)
+				conns = append(conns, conn)
+			}
+			defer func() {
+				for _, conn := range conns {
+					_ = conn.Close()
+				}
+			}()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				payload := payloads[i%bm.uniqueMessages]
+				_, err := n.Publish("test", payload)
+				if err != nil {
+					panic(err)
+				}
+				for _, conn := range conns {
+					_, _, err = conn.ReadMessage()
+					if err != nil {
+						panic(err)
+					}
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkWsCommandReplyV2(b *testing.B) {
+	n := defaultTestNodeBenchmark(b)
+	defer func() { _ = n.Shutdown(context.Background()) }()
+
+	n.OnConnect(func(client *Client) {
+		client.OnRPC(func(event RPCEvent, callback RPCCallback) {
+			callback(RPCReply{
+				Data: []byte("{}"),
+			}, nil)
+		})
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("/connection/websocket", testAuthMiddleware(NewWebsocketHandler(n, WebsocketConfig{
+		WriteBufferSize: 0,
+		ReadBufferSize:  0,
+	})))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	url := "ws" + server.URL[4:]
+
+	payload := []byte(`{"input": "test"}`)
+
+	benchmarks := []struct {
+		name    string
+		getConn func(b testing.TB, url string, compression bool) *websocket.Conn
+	}{
+		{"JSON", newRealConnJSONConnect},
+		{"PB", newRealConnProtobufConnect},
+	}
+
+	rpcRequest := &protocol.RPCRequest{
+		Data: payload,
+	}
+
+	cmd := &protocol.Command{
+		Id:  1,
+		Rpc: rpcRequest,
+	}
+	jsonCommand, _ := json.Marshal(cmd)
+
+	cmdBytes, _ := cmd.MarshalVT()
+
+	var buf bytes.Buffer
+	bs := make([]byte, 8)
+	nBytes := binary.PutUvarint(bs, uint64(len(cmdBytes)))
+	buf.Write(bs[:nBytes])
+	buf.Write(cmdBytes)
+
+	protobufCommand := buf.Bytes()
+
+	for _, bm := range benchmarks {
+		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
+			conn := bm.getConn(b, url, false)
+			defer func() { _ = conn.Close() }()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				var err error
+				if bm.name == "JSON" {
+					err = conn.WriteMessage(websocket.TextMessage, jsonCommand)
+				} else {
+					err = conn.WriteMessage(websocket.BinaryMessage, protobufCommand)
+				}
+				if err != nil {
+					b.Fatal(err)
+				}
+				_, _, err = conn.ReadMessage()
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkWsCommandReplyV2Multiple(b *testing.B) {
+	n := defaultTestNodeBenchmark(b)
+	defer func() { _ = n.Shutdown(context.Background()) }()
+
+	n.OnConnect(func(client *Client) {
+		client.OnRPC(func(event RPCEvent, callback RPCCallback) {
+			callback(RPCReply{
+				Data: []byte(`{"test_response": 1}`),
+			}, nil)
+		})
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("/connection/websocket", testAuthMiddleware(NewWebsocketHandler(n, WebsocketConfig{
+		WriteBufferSize: 0,
+		ReadBufferSize:  0,
+	})))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	url := "ws" + server.URL[4:]
+
+	payload := []byte(`{"input": "test"}`)
+
+	benchmarks := []struct {
+		name    string
+		getConn func(b testing.TB, url string, compression bool) *websocket.Conn
+	}{
+		{"JSON", newRealConnJSONConnect},
+		{"PB", newRealConnProtobufConnect},
+	}
+
+	rpcRequest := &protocol.RPCRequest{
+		Data: payload,
+	}
+
+	cmd := &protocol.Command{
+		Id:  1,
+		Rpc: rpcRequest,
+	}
+	jsonBytes, _ := json.Marshal(cmd)
+	jsonCommand := append([]byte{}, jsonBytes...)
+	jsonCommand = append(jsonCommand, []byte("\n")...)
+	jsonCommand = append(jsonCommand, jsonBytes...)
+	jsonCommand = append(jsonCommand, []byte("\n")...)
+	jsonCommand = append(jsonCommand, jsonBytes...)
+	jsonCommand = append(jsonCommand, []byte("\n")...)
+	jsonCommand = append(jsonCommand, jsonBytes...)
+
+	cmdBytes, _ := cmd.MarshalVT()
+
+	var buf bytes.Buffer
+	bs := make([]byte, 8)
+	nBytes := binary.PutUvarint(bs, uint64(len(cmdBytes)))
+	buf.Write(bs[:nBytes])
+	buf.Write(cmdBytes)
+	bs = make([]byte, 8)
+	nBytes = binary.PutUvarint(bs, uint64(len(cmdBytes)))
+	buf.Write(bs[:nBytes])
+	buf.Write(cmdBytes)
+	bs = make([]byte, 8)
+	nBytes = binary.PutUvarint(bs, uint64(len(cmdBytes)))
+	buf.Write(bs[:nBytes])
+	buf.Write(cmdBytes)
+	bs = make([]byte, 8)
+	nBytes = binary.PutUvarint(bs, uint64(len(cmdBytes)))
+	buf.Write(bs[:nBytes])
+	buf.Write(cmdBytes)
+
+	protobufCommand := buf.Bytes()
+
+	for _, bm := range benchmarks {
+		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
+			conn := bm.getConn(b, url, false)
+			defer func() { _ = conn.Close() }()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				var err error
+				if bm.name == "JSON" {
+					err = conn.WriteMessage(websocket.TextMessage, jsonCommand)
+				} else {
+					err = conn.WriteMessage(websocket.BinaryMessage, protobufCommand)
+				}
+				if err != nil {
+					b.Fatal(err)
+				}
+				var n int
+				for {
+					_, d, err := conn.ReadMessage()
+					if err != nil {
+						b.Fatal(err)
+					}
+					n += strings.Count(string(d), "test_response")
+					if n == 4 {
+						break
+					}
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkWsCommandReplyV2MultipleParallel(b *testing.B) {
+	n := defaultTestNodeBenchmark(b)
+	defer func() { _ = n.Shutdown(context.Background()) }()
+
+	n.OnConnect(func(client *Client) {
+		client.OnRPC(func(event RPCEvent, callback RPCCallback) {
+			go func() {
+				callback(RPCReply{
+					Data: event.Data,
+				}, nil)
+			}()
+		})
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("/connection/websocket", testAuthMiddleware(NewWebsocketHandler(n, WebsocketConfig{
+		WriteBufferSize: 0,
+		ReadBufferSize:  0,
+	})))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	url := "ws" + server.URL[4:]
+
+	benchmarks := []struct {
+		name    string
+		getConn func(b testing.TB, url string, compression bool) *websocket.Conn
+	}{
+		{"JSON", newRealConnJSONConnect},
+		{"PB", newRealConnProtobufConnect},
+	}
+
+	cmd1 := &protocol.Command{
+		Id: 1,
+		Rpc: &protocol.RPCRequest{
+			Data: []byte(`{"input":"test1"}`),
+		},
+	}
+	cmd2 := &protocol.Command{
+		Id: 2,
+		Rpc: &protocol.RPCRequest{
+			Data: []byte(`{"input":"test2"}`),
+		},
+	}
+	cmd3 := &protocol.Command{
+		Id: 3,
+		Rpc: &protocol.RPCRequest{
+			Data: []byte(`{"input":"test3"}`),
+		},
+	}
+
+	jsonBytes1, _ := json.Marshal(cmd1)
+	jsonCommand := append([]byte{}, jsonBytes1...)
+	jsonCommand = append(jsonCommand, []byte("\n")...)
+	jsonBytes2, _ := json.Marshal(cmd2)
+	jsonCommand = append(jsonCommand, jsonBytes2...)
+	jsonCommand = append(jsonCommand, []byte("\n")...)
+	jsonBytes3, _ := json.Marshal(cmd3)
+	jsonCommand = append(jsonCommand, jsonBytes3...)
+
+	cmdBytes1, _ := cmd1.MarshalVT()
+	cmdBytes2, _ := cmd2.MarshalVT()
+	cmdBytes3, _ := cmd3.MarshalVT()
+	var buf bytes.Buffer
+	bs := make([]byte, 8)
+	nBytes := binary.PutUvarint(bs, uint64(len(cmdBytes1)))
+	buf.Write(bs[:nBytes])
+	buf.Write(cmdBytes1)
+	bs = make([]byte, 8)
+	nBytes = binary.PutUvarint(bs, uint64(len(cmdBytes2)))
+	buf.Write(bs[:nBytes])
+	buf.Write(cmdBytes2)
+	bs = make([]byte, 8)
+	nBytes = binary.PutUvarint(bs, uint64(len(cmdBytes3)))
+	buf.Write(bs[:nBytes])
+	buf.Write(cmdBytes3)
+	protobufCommand := buf.Bytes()
+
+	for _, bm := range benchmarks {
+		b.Run(bm.name, func(b *testing.B) {
+			b.RunParallel(func(pb *testing.PB) {
+				conn := bm.getConn(b, url, false)
+				defer func() { _ = conn.Close() }()
+				b.ResetTimer()
+				b.ReportAllocs()
+				for pb.Next() {
+					var err error
+					if bm.name == "JSON" {
+						err = conn.WriteMessage(websocket.TextMessage, jsonCommand)
+					} else {
+						err = conn.WriteMessage(websocket.BinaryMessage, protobufCommand)
+					}
+					if err != nil {
+						b.Fatal(err)
+					}
+					var n int
+					for {
+						_, d, err := conn.ReadMessage()
+						if err != nil {
+							b.Fatal(err)
+						}
+						var dec protocol.ReplyDecoder
+						if bm.name == "JSON" {
+							dec = protocol.NewJSONReplyDecoder(d)
+						} else {
+							dec = protocol.NewProtobufReplyDecoder(d)
+						}
+						for {
+							reply, err := dec.Decode()
+							if reply != nil {
+								if reply.Rpc == nil {
+									continue
+								}
+								if reply.Id == 1 && !bytes.Equal(reply.Rpc.Data, []byte(`{"input":"test1"}`)) {
+									b.Fatal("unexpected payload")
+								}
+								if reply.Id == 2 && !bytes.Equal(reply.Rpc.Data, []byte(`{"input":"test2"}`)) {
+									b.Fatal("unexpected payload")
+								}
+								if reply.Id == 3 && !bytes.Equal(reply.Rpc.Data, []byte(`{"input":"test3"}`)) {
+									b.Fatal("unexpected payload")
+								}
+								n += 1
+							}
+							if err == io.EOF {
+								break
+							}
+						}
+						if n == 3 {
+							break
+						}
+					}
+				}
+			})
+		})
+	}
+}
+
+// TestWebsocketTransportAcceptProtocol verifies AcceptProtocol gets propagated from
+// the original HTTP request's protocol version.
+func TestWebsocketTransportAcceptProtocol(t *testing.T) {
+	t.Parallel()
+	transport := &websocketTransport{
+		opts: websocketTransportOptions{
+			protoMajor: 1,
+			protoType:  ProtocolTypeJSON,
+		},
+	}
+	require.Equal(t, "h1", transport.AcceptProtocol())
+}
+
+// dialCompressed opens a permessage-deflate WebSocket connection to handler and
+// returns the client conn. The client compresses outbound frames at the maximum
+// level so a redundant payload yields a tiny compressed frame.
+func dialCompressed(t *testing.T, config WebsocketConfig) *websocket.Conn {
+	t.Helper()
+	n, _ := New(Config{})
+	require.NoError(t, n.Run())
+	t.Cleanup(func() { _ = n.Shutdown(context.Background()) })
+
+	config.CheckOrigin = func(r *http.Request) bool { return true }
+	mux := http.NewServeMux()
+	mux.Handle("/connection/websocket", NewWebsocketHandler(n, config))
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	dialer := &websocket.Dialer{EnableCompression: true}
+	url := "ws" + server.URL[4:]
+	conn, resp, _, err := dialer.Dial(url+"/connection/websocket", nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	t.Cleanup(func() { _ = conn.Close() })
+	require.NoError(t, conn.SetCompressionLevel(9))
+	return conn
+}
+
+// TestWebsocketHandlerDecompressionBombRejected proves end-to-end that with
+// compression enabled the default decompressed limit (MessageSizeLimit *
+// defaultWebsocketDecompressedMessageSizeLimitMultiplier) rejects a tiny
+// compressed frame that inflates past the limit, before any authentication.
+func TestWebsocketHandlerDecompressionBombRejected(t *testing.T) {
+	t.Parallel()
+	// MessageSizeLimit 1024 -> decompressed limit = 1024 * 10 = 10240 bytes.
+	conn := dialCompressed(t, WebsocketConfig{
+		Compression:      true,
+		MessageSizeLimit: 1024,
+	})
+
+	// 64KB of zeros compresses to well under the 1024-byte compressed limit but
+	// inflates far past the 10240-byte decompressed limit.
+	bomb := make([]byte, 64*1024)
+	require.NoError(t, conn.WriteMessage(websocket.BinaryMessage, bomb))
+
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, _, err := conn.ReadMessage()
+	require.Error(t, err)
+	require.Truef(t, websocket.IsCloseError(err, websocket.CloseMessageTooBig),
+		"expected close %d, got %v", websocket.CloseMessageTooBig, err)
+	var closeErr *websocket.CloseError
+	require.ErrorAs(t, err, &closeErr)
+	require.Contains(t, closeErr.Text, "after decompression")
+}
+
+// TestWebsocketHandlerOutgoingCloseMetric proves the server-sent 1009 close from
+// the decompression-limit path is recorded in the outgoing close metric labeled
+// by transport and code.
+func TestWebsocketHandlerOutgoingCloseMetric(t *testing.T) {
+	t.Parallel()
+	n, _ := New(Config{})
+	require.NoError(t, n.Run())
+	defer func() { _ = n.Shutdown(context.Background()) }()
+	mux := http.NewServeMux()
+	mux.Handle("/connection/websocket", NewWebsocketHandler(n, WebsocketConfig{
+		Compression:      true,
+		MessageSizeLimit: 1024, // decompressed limit = 10240
+		CheckOrigin:      func(r *http.Request) bool { return true },
+	}))
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	dialer := &websocket.Dialer{EnableCompression: true}
+	url := "ws" + server.URL[4:]
+	conn, resp, _, err := dialer.Dial(url+"/connection/websocket", nil)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	defer func() { _ = conn.Close() }()
+	require.NoError(t, conn.SetCompressionLevel(9))
+
+	bomb := make([]byte, 64*1024)
+	require.NoError(t, conn.WriteMessage(websocket.BinaryMessage, bomb))
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, _, _ = conn.ReadMessage() // server closes with 1009
+
+	counter := n.metrics.transportOutgoingCloseCount.WithLabelValues(transportWebsocket, "1009")
+	require.Eventually(t, func() bool {
+		var m dto.Metric
+		if err := counter.Write(&m); err != nil {
+			return false
+		}
+		return m.GetCounter().GetValue() == 1
+	}, 2*time.Second, 10*time.Millisecond, "expected outgoing close 1009 to be metered")
+}
+
+// TestWebsocketHandlerDecompressedMessageSizeLimitOverride proves the explicit
+// DecompressedMessageSizeLimit takes precedence over the multiplier-derived
+// default: a payload that would pass the multiplier limit (10240) but exceeds
+// the override (2048) is rejected.
+func TestWebsocketHandlerDecompressedMessageSizeLimitOverride(t *testing.T) {
+	t.Parallel()
+	conn := dialCompressed(t, WebsocketConfig{
+		Compression:                  true,
+		MessageSizeLimit:             1024, // multiplier default would be 10240
+		DecompressedMessageSizeLimit: 2048, // explicit, must win
+	})
+
+	// 4096 zeros: > 2048 (override) but < 10240 (multiplier). A 1009 close
+	// therefore proves the override is in effect; otherwise the frame would
+	// pass the size gate and be rejected later as an invalid command.
+	payload := make([]byte, 4096)
+	require.NoError(t, conn.WriteMessage(websocket.BinaryMessage, payload))
+
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, _, err := conn.ReadMessage()
+	require.Error(t, err)
+	require.Truef(t, websocket.IsCloseError(err, websocket.CloseMessageTooBig),
+		"expected close %d (override in effect), got %v", websocket.CloseMessageTooBig, err)
+}
+
+// TestWebsocketHandlerCompressedHeadroom proves the multiplier leaves headroom
+// above MessageSizeLimit for legitimately compressible inbound frames: a payload
+// larger than MessageSizeLimit but within the decompressed limit is NOT rejected
+// for being too big (it is only later rejected as an invalid command, with a
+// different close code).
+func TestWebsocketHandlerCompressedHeadroom(t *testing.T) {
+	t.Parallel()
+	conn := dialCompressed(t, WebsocketConfig{
+		Compression:      true,
+		MessageSizeLimit: 1024, // decompressed limit = 10240
+	})
+
+	// 4096 zeros: > MessageSizeLimit (1024) but < decompressed limit (10240).
+	payload := make([]byte, 4096)
+	require.NoError(t, conn.WriteMessage(websocket.BinaryMessage, payload))
+
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, _, err := conn.ReadMessage()
+	require.Error(t, err) // invalid command -> disconnect, but...
+	require.Falsef(t, websocket.IsCloseError(err, websocket.CloseMessageTooBig),
+		"frame within decompressed limit must not be rejected as too big, got %v", err)
+}
