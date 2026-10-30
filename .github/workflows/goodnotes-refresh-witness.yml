@@ -1,0 +1,113 @@
+name: Goodnotes refresh witness
+
+# Focused CI for the Goodnotes refresh-applied witness v1 on top of official v6.9.1.
+# Read-only: no secrets, no services, no image, no publish, no deploy. Its job name is the
+# stable check-run name a sparse Centrifugo closure lists under review.requiredChecks.
+on:
+  push:
+    branches:
+      - 'goodnotes/**'
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: goodnotes-refresh-witness-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  witness:
+    name: Goodnotes refresh witness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # Same toolchain contract as the trusted sparse builder (golang:1.26.2, GOTOOLCHAIN=local).
+      GOTOOLCHAIN: local
+      GOWORK: 'off'
+      GOFLAGS: -mod=readonly
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          lfs: false
+          submodules: false
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26.2'
+          check-latest: false
+          cache: false
+
+      - name: Exact Go toolchain
+        run: |
+          set -euo pipefail
+          test "$(go env GOVERSION)" = go1.26.2
+          test "$(go env GOTOOLCHAIN)" = local
+          test "$(go env GOWORK)" = off
+
+      - name: gofmt on Goodnotes-changed Go files
+        run: |
+          set -euo pipefail
+          base=4603be29243501f4ac2787de17c4f0428b27864e # official v6.9.1
+          git merge-base --is-ancestor "$base" HEAD
+          # Ours = every Go file changed since v6.9.1 outside the vendored SDK, plus the SDK additions.
+          # (Two calls: a pathspec exclude would also drop the SDK additions.)
+          mapfile -t files < <({ git diff --name-only --diff-filter=ACMR "$base" HEAD -- '*.go' ':(exclude)third_party/**'
+                                 git diff --name-only --diff-filter=ACMR "$base" HEAD -- 'third_party/centrifuge/goodnotes_*.go'; })
+          test "${#files[@]}" -gt 0
+          printf '%s\n' "${files[@]}"
+          unformatted="$(gofmt -l "${files[@]}")"
+          if [ -n "$unformatted" ]; then
+            printf '::error::gofmt needed: %s\n' "$unformatted"
+            exit 1
+          fi
+
+      - name: Build (CGO_ENABLED=0 linux/amd64, as the image recipe)
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+        run: go build -trimpath -buildvcs=false ./...
+
+      - name: Vet witness packages
+        run: go vet ./internal/client/ ./internal/proxy/
+
+      - name: Witness tests with race detector (real Handler, Client, timers)
+        env:
+          CGO_ENABLED: '1'
+        run: |
+          set -euo pipefail
+          go test -race -count=1 -run '^TestGoodnotes' -v ./internal/client/ ./internal/proxy/ | tee witness.log
+          # A pattern that silently matches nothing must not pass.
+          for t in TestGoodnotesRefreshWitnessVectorsMatchSharedFile \
+                   TestGoodnotesRefreshWitnessAppliedLineIsClosedAndContentFree \
+                   TestGoodnotesRefreshWitnessDistinguishesGraceClampAndClose \
+                   TestGoodnotesRefreshWitnessDisabledTokenPathAndPanicsEmitNothing \
+                   TestGoodnotesRefreshWitnessEnvDefaultIsOff \
+                   TestGoodnotesSubRefreshWitnessVectorsMatchSharedFile \
+                   TestGoodnotesSubRefreshWitnessAppliedRefusedAndSafety \
+                   TestGoodnotesRefreshWitnessE2EBackendExpiryApplied \
+                   TestGoodnotesRefreshWitnessE2EProxyErrorGraceIsTypedNotBackend \
+                   TestGoodnotesRefreshWitnessE2EClampShowsMismatch \
+                   TestGoodnotesRefreshWitnessE2EExpiredAndDisconnectOnlyClose \
+                   TestGoodnotesRefreshOutcomeTypesEveryHTTPBranch \
+                   TestGoodnotesSubRefreshOutcomeTypesEveryHTTPBranch; do
+            grep -q -- "--- PASS: $t " witness.log
+          done
+
+      - name: Vendored SDK accessor tests with race detector
+        working-directory: third_party/centrifuge
+        env:
+          CGO_ENABLED: '1'
+        run: |
+          set -euo pipefail
+          go test -race -count=1 -run '^TestApplied(Refresh|Subscription)State' -v . | tee ../../sdk.log
+          for t in TestAppliedRefreshStateReflectsConnectExpiration \
+                   TestAppliedRefreshStateAfterServerSideRefreshApplied \
+                   TestAppliedRefreshStateAfterExpiredRefreshIsClosed \
+                   TestAppliedRefreshStateAfterHandlerErrorIsClosed \
+                   TestAppliedSubscriptionStateReadsTheRenewedChannelExpiration; do
+            grep -q -- "--- PASS: $t " ../../sdk.log
+          done
