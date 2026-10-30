@@ -308,6 +308,7 @@ type Client struct {
 	pingInterval           time.Duration
 	pongTimeout            time.Duration
 	eventHub               *clientEventHub
+	gn                     goodnotesTimingState // Goodnotes timing witness; observability only.
 	timer                  *time.Timer
 	timerCanceler          TimerCanceler // TimerCanceler if TimerScheduler is used.
 	startWriterOnce        sync.Once
@@ -527,7 +528,7 @@ func (c *Client) onTimerOp() {
 	case timerOpPresence:
 		c.updatePresence()
 	case timerOpExpire:
-		c.expire()
+		c.expireFrom(true)
 	case timerOpPing:
 		c.sendPing()
 	case timerOpPong:
@@ -567,6 +568,9 @@ func (c *Client) scheduleNextTimer() {
 	if needTimer {
 		c.timerOp = nextTimerOp
 		afterDuration := time.Duration(minEventTime-time.Now().UnixNano()) * time.Nanosecond
+		if nextTimerOp == timerOpExpire {
+			c.gnArmLocked(afterDuration)
+		}
 		if c.node.timerScheduler != nil {
 			c.timerCanceler = c.node.timerScheduler.ScheduleTimer(afterDuration, c.onTimerOp)
 		} else {
@@ -807,20 +811,28 @@ func (c *Client) checkSubscriptionExpiration(channel string, channelContext Chan
 	clientSideRefresh := channelHasFlag(channelContext.flags, flagClientSideRefresh)
 	if expireAt > 0 && nowUnix > expireAt+int64(delay.Seconds()) {
 		// Subscription expired.
+		gnCause := c.gnSubTrigger(channel, expireAt, int64(delay.Seconds()), !clientSideRefresh, c.eventHub.subRefreshHandler != nil)
 		if clientSideRefresh || c.eventHub.subRefreshHandler == nil {
 			// The only way subscription could be refreshed in this case is via
 			// SUB_REFRESH command sent from client but looks like that command
 			// with new refreshed token have not been received in configured window.
+			c.gnSubResult(GoodnotesSubNotApplied, gnCause, channel, expireAt, 0, GoodnotesBranchClientSideOrNoHandler)
 			resultCB(false)
 			return
 		}
 		cb := func(reply SubRefreshReply, err error) {
 			if err != nil {
+				c.gnSubResult(GoodnotesSubNotApplied, gnCause, channel, expireAt, 0, GoodnotesBranchHandlerError)
 				resultCB(false)
 				return
 			}
 			newExpireAt := min(reply.ExpireAt, nowUnix+maxTTLSeconds)
 			if reply.Expired || (newExpireAt > 0 && newExpireAt < nowUnix) {
+				gnBranch := GoodnotesBranchExpired
+				if !reply.Expired {
+					gnBranch = GoodnotesBranchPastExpiration
+				}
+				c.gnSubResult(GoodnotesSubNotApplied, gnCause, channel, expireAt, 0, gnBranch)
 				resultCB(false)
 				return
 			}
@@ -829,8 +841,12 @@ func (c *Client) checkSubscriptionExpiration(channel string, channelContext Chan
 				if len(reply.Info) > 0 {
 					ctx.info = reply.Info
 				}
+				gnPrior := ctx.expireAt
 				ctx.expireAt = newExpireAt
 				c.channels[channel] = ctx
+				c.gnSubResult(GoodnotesSubStateApplied, gnCause, channel, gnPrior, newExpireAt, GoodnotesBranchNone)
+			} else {
+				c.gnSubResult(GoodnotesSubNotApplied, gnCause, channel, expireAt, 0, GoodnotesBranchChannelMissing)
 			}
 			c.mu.Unlock()
 			resultCB(true)
@@ -1610,27 +1626,36 @@ func (c *Client) checkExpired() {
 const maxTTLSeconds = 365 * 24 * 3600
 
 func (c *Client) expire() {
+	c.expireFrom(false)
+}
+
+func (c *Client) expireFrom(timerDispatch bool) {
 	c.mu.RLock()
 	closed := c.status == statusClosed
 	clientSideRefresh := c.clientSideRefresh
 	exp := c.exp
+	gnSnapshot := c.gnConnSnapshotLocked()
 	c.mu.RUnlock()
 	if closed || exp == 0 {
 		return
 	}
+	gnCause := c.gnConnTrigger(gnSnapshot, exp, timerDispatch, !clientSideRefresh, c.eventHub.refreshHandler != nil)
 	if !clientSideRefresh && c.eventHub.refreshHandler != nil {
 		cb := func(reply RefreshReply, err error) {
 			if err != nil {
 				disconnect, ok := disconnectFromError(err)
 				if ok {
+					c.gnConnNotApplied(gnCause, exp, GoodnotesBranchDisconnect)
 					_ = c.close(*disconnect)
 					return
 				}
+				c.gnConnNotApplied(gnCause, exp, GoodnotesBranchHandlerError)
 				c.node.logger.log(newErrorLogEntry(err, "unexpected error from refresh handler", map[string]any{"user": c.user, "client": c.uid, "error": err.Error()}))
 				_ = c.close(DisconnectServerError)
 				return
 			}
 			if reply.Expired {
+				c.gnConnNotApplied(gnCause, exp, GoodnotesBranchExpired)
 				_ = c.close(DisconnectExpired)
 				return
 			}
@@ -1638,11 +1663,15 @@ func (c *Client) expire() {
 			expireAt := min(reply.ExpireAt, nowUnix+maxTTLSeconds)
 			if expireAt > 0 {
 				c.mu.Lock()
+				gnPrior := c.exp
 				c.exp = expireAt
+				c.gnRecordStateLocked(GoodnotesOriginNaturalServerRefresh, gnPrior, expireAt, gnCause)
 				if reply.Info != nil {
 					c.info = reply.Info
 				}
 				c.mu.Unlock()
+			} else {
+				c.gnConnNotApplied(gnCause, exp, GoodnotesBranchZeroExpiration)
 			}
 			c.checkExpired()
 		}
@@ -1725,7 +1754,9 @@ func (c *Client) Refresh(opts ...RefreshOption) error {
 		if ttl > 0 {
 			// connection refreshed, update client timestamp and set new expiration timeout
 			c.mu.Lock()
+			gnPrior := c.exp
 			c.exp = expireAt
+			c.gnRecordStateLocked(GoodnotesOriginServerAPI, gnPrior, expireAt, 0)
 			if len(info) > 0 {
 				c.info = info
 			}
@@ -1738,7 +1769,9 @@ func (c *Client) Refresh(opts ...RefreshOption) error {
 		}
 	} else {
 		c.mu.Lock()
+		gnPrior := c.exp
 		c.exp = 0
+		c.gnRecordStateLocked(GoodnotesOriginServerAPI, gnPrior, 0, 0)
 		c.mu.Unlock()
 	}
 
@@ -1818,7 +1851,9 @@ func (c *Client) handleRefresh(req *protocol.RefreshRequest, cmd *protocol.Comma
 			if ttl > 0 {
 				// connection refreshed, update client timestamp and set new expiration timeout
 				c.mu.Lock()
+				gnPrior := c.exp
 				c.exp = expireAt
+				c.gnRecordStateLocked(GoodnotesOriginClientCommand, gnPrior, expireAt, 0)
 				if len(info) > 0 {
 					c.info = info
 				}
@@ -2745,7 +2780,9 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 	c.mu.Lock()
 	c.user = credentials.UserID
 	c.info = credentials.Info
+	gnPrior := c.exp
 	c.exp = min(credentials.ExpireAt, time.Now().Unix()+maxTTLSeconds)
+	c.gnRecordStateLocked(GoodnotesOriginConnect, gnPrior, c.exp, 0)
 
 	user := c.user
 	exp := c.exp

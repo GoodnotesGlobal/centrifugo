@@ -11,11 +11,18 @@
   not part of the build. Expected vendored tree before additions: `4f95b599b8155a3eaa099934add48164f62dace5`;
 - MIT License (`third_party/centrifuge/LICENSE`, unchanged).
 
-It adds exactly two files and modifies none:
+It adds exactly four files:
 
 - `goodnotes_applied_refresh_state.go`: read-only accessors `AppliedRefreshState()` and
-  `AppliedSubscriptionState(channel)`;
-- `goodnotes_applied_refresh_state_test.go`.
+  `AppliedSubscriptionState(channel)` (applied witness v1);
+- `goodnotes_timing_observer.go`: the refresh-timing witness types, typed send-only sink and helpers;
+- their two `_test.go` files.
+
+It modifies exactly one upstream file, `client.go`: official blob `c6a42b294d7b9f09a9f72e421ffe62f8bb2fa09c`
+plus the reviewable patch `third_party/goodnotes-centrifuge-client.go.patch` (sha256 pinned in the
+verify script) gives blob `1d4b2cbade2947089cdc9ff73baeb410061f6b04`. The patch only adds observation hook
+calls: a sidecar field, expire-dispatch source, expire-arm snapshot, and records at the existing expiration
+writers and sub-refresh branches. No timer value, assignment, branch, error or close code changes.
 
 The root `go.mod` uses `replace github.com/centrifugal/centrifuge => ./third_party/centrifuge`.
 No other module is replaced and nothing is downloaded or patched at build time. Verify with

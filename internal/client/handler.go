@@ -185,6 +185,8 @@ func (h *Handler) Setup() error {
 	concurrency := cfg.Client.Concurrency
 
 	h.node.OnConnect(func(client *centrifuge.Client) {
+		// Goodnotes refresh-timing witness v1: before the SDK arms on-connect timers.
+		installRefreshTimingObserver(client)
 
 		var semaphore chan struct{}
 		if concurrency > 1 {
