@@ -40,7 +40,24 @@ func NewRefreshHandler(c RefreshHandlerConfig) *RefreshHandler {
 
 type RefreshExtra struct {
 	Meta json.RawMessage
+	// Outcome types which branch produced the reply (Goodnotes refresh-applied witness v1).
+	// It never changes the reply or error values.
+	Outcome RefreshOutcome
 }
+
+// RefreshOutcome names the refresh proxy branch that produced a reply.
+type RefreshOutcome string
+
+const (
+	RefreshOutcomeConnClosed        RefreshOutcome = "connClosed"
+	RefreshOutcomeProxyErrorGrace60 RefreshOutcome = "proxyErrorGrace60"
+	RefreshOutcomeNoResult          RefreshOutcome = "noResult"
+	RefreshOutcomeBackendExpired    RefreshOutcome = "backendExpired"
+	RefreshOutcomeDecodeError       RefreshOutcome = "decodeError"
+	RefreshOutcomeBackendExpireAt   RefreshOutcome = "backendExpireAt"
+	// RefreshOutcomeNotAvailable: sub refresh proxy not configured for the channel.
+	RefreshOutcomeNotAvailable RefreshOutcome = "notAvailable"
+)
 
 // RefreshHandlerFunc ...
 type RefreshHandlerFunc func(Client, centrifuge.RefreshEvent, PerCallData) (centrifuge.RefreshReply, RefreshExtra, error)
@@ -68,7 +85,7 @@ func (h *RefreshHandler) Handle() RefreshHandlerFunc {
 			select {
 			case <-client.Context().Done():
 				// Client connection already closed.
-				return centrifuge.RefreshReply{}, RefreshExtra{}, centrifuge.DisconnectConnectionClosed
+				return centrifuge.RefreshReply{}, RefreshExtra{Outcome: RefreshOutcomeConnClosed}, centrifuge.DisconnectConnectionClosed
 			default:
 			}
 			h.summary.Observe(duration)
@@ -82,7 +99,7 @@ func (h *RefreshHandler) Handle() RefreshHandlerFunc {
 			// like a reasonable value.
 			return centrifuge.RefreshReply{
 				ExpireAt: time.Now().Unix() + 60,
-			}, RefreshExtra{}, nil
+			}, RefreshExtra{Outcome: RefreshOutcomeProxyErrorGrace60}, nil
 		}
 		h.summary.Observe(duration)
 		h.histogram.Observe(duration)
@@ -93,13 +110,13 @@ func (h *RefreshHandler) Handle() RefreshHandlerFunc {
 			log.Error().Msg("no refresh result found")
 			return centrifuge.RefreshReply{
 				Expired: true,
-			}, RefreshExtra{}, nil
+			}, RefreshExtra{Outcome: RefreshOutcomeNoResult}, nil
 		}
 
 		if result.Expired {
 			return centrifuge.RefreshReply{
 				Expired: true,
-			}, RefreshExtra{}, nil
+			}, RefreshExtra{Outcome: RefreshOutcomeBackendExpired}, nil
 		}
 
 		var info []byte
@@ -107,14 +124,14 @@ func (h *RefreshHandler) Handle() RefreshHandlerFunc {
 			decodedInfo, err := base64.StdEncoding.DecodeString(result.B64Info)
 			if err != nil {
 				log.Error().Err(err).Str("client", client.ID()).Msg("error decoding base64 info")
-				return centrifuge.RefreshReply{}, RefreshExtra{}, centrifuge.ErrorInternal
+				return centrifuge.RefreshReply{}, RefreshExtra{Outcome: RefreshOutcomeDecodeError}, centrifuge.ErrorInternal
 			}
 			info = decodedInfo
 		} else {
 			info = result.Info
 		}
 
-		extra := RefreshExtra{}
+		extra := RefreshExtra{Outcome: RefreshOutcomeBackendExpireAt}
 		if result.Meta != nil {
 			extra.Meta = json.RawMessage(result.Meta)
 		}

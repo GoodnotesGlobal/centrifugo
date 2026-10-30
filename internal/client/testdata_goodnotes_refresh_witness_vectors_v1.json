@@ -1,0 +1,43 @@
+{
+  "expiryDomain": "goodnotes.centrifugo.refresh-expiry.v1\u0000",
+  "kDomain": "goodnotes.centrifugo.refresh.v1\u0000",
+  "schemaVersion": 1,
+  "subRefreshExpiryDomain": "goodnotes.centrifugo.sub-refresh-expiry.v1\u0000",
+  "subRefreshKDomain": "goodnotes.centrifugo.sub-refresh.v1\u0000",
+  "subRefreshVectors": [
+    {
+      "channel": "textdoc-presence:22222222-2222-7222-8222-222222222222",
+      "client": "11111111-1111-4111-8111-111111111111",
+      "expireAt": 1793000020,
+      "expiryCommit": "d6620ce133f98d86a60ffb02cb0aa62c564850dae85cd43e2fc717c7f9485544",
+      "k": "232e5ff34ad82f1a0adb07d1b13ab8ebfdba76b9fdc375b940f77906252eb5b0"
+    },
+    {
+      "channel": "textdoc-awareness:文档",
+      "client": "客户端",
+      "expireAt": 1,
+      "expiryCommit": "913f1871ba2bc0123263bcdc2fc0f5ecdd4979dbc7199ba08b2d56275acaa445",
+      "k": "512abc9db4bdbef3b02ad4d948ec92c4c6275d0f9f3e535212b46de464ee5976"
+    }
+  ],
+  "vectors": [
+    {
+      "client": "11111111-1111-4111-8111-111111111111",
+      "expireAt": 1793000000,
+      "expiryCommit": "8b2061eba64a10b9105536631838ea506c29c85e0dbfd7b0129e196e31e248c3",
+      "k": "0771612aacfbab39061aa21bee5ef1057e72e49dda6b2eba12ed83edf33d0091"
+    },
+    {
+      "client": "客户端",
+      "expireAt": 1,
+      "expiryCommit": "4de3aa0ba3f868e955c7ec8a9af5c272db0c34f21a94fcd2fc1b7bab0b006f48",
+      "k": "8ba9aa8ca0b923760464be6dabcdfc29c8fbb90f67a8588ffe986136ec4f895b"
+    },
+    {
+      "client": "c",
+      "expireAt": 1824536000,
+      "expiryCommit": "d11e5d2620115b6057d88a235c88d8fdc2073a0e638a38264d9c1867c606df79",
+      "k": "4abd4a9e78e415574084997bbdd57f0a6e7cbd705fd36e88a8a09dd4ee3df2bd"
+    }
+  ]
+}

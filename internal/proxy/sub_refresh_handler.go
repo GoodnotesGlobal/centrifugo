@@ -50,6 +50,9 @@ func NewSubRefreshHandler(c SubRefreshHandlerConfig) *SubRefreshHandler {
 }
 
 type SubRefreshExtra struct {
+	// Outcome types which branch produced the reply (Goodnotes refresh-applied witness v1).
+	// It never changes the reply or error values.
+	Outcome RefreshOutcome
 }
 
 // SubRefreshHandlerFunc ...
@@ -69,7 +72,7 @@ func (h *SubRefreshHandler) Handle() SubRefreshHandlerFunc {
 		proxyName := chOpts.SubRefreshProxyName
 		if !proxyEnabled {
 			log.Info().Str("channel", e.Channel).Msg("sub refresh proxy not configured for a channel")
-			return centrifuge.SubRefreshReply{}, SubRefreshExtra{}, centrifuge.ErrorNotAvailable
+			return centrifuge.SubRefreshReply{}, SubRefreshExtra{Outcome: RefreshOutcomeNotAvailable}, centrifuge.ErrorNotAvailable
 		}
 		p = h.config.Proxies[proxyName]
 		summary = h.summary[proxyName]
@@ -97,7 +100,7 @@ func (h *SubRefreshHandler) Handle() SubRefreshHandlerFunc {
 			select {
 			case <-client.Context().Done():
 				// Client connection already closed.
-				return centrifuge.SubRefreshReply{}, SubRefreshExtra{}, centrifuge.DisconnectConnectionClosed
+				return centrifuge.SubRefreshReply{}, SubRefreshExtra{Outcome: RefreshOutcomeConnClosed}, centrifuge.DisconnectConnectionClosed
 			default:
 			}
 			summary.Observe(duration)
@@ -111,7 +114,7 @@ func (h *SubRefreshHandler) Handle() SubRefreshHandlerFunc {
 			// like a reasonable value.
 			return centrifuge.SubRefreshReply{
 				ExpireAt: time.Now().Unix() + 60,
-			}, SubRefreshExtra{}, nil
+			}, SubRefreshExtra{Outcome: RefreshOutcomeProxyErrorGrace60}, nil
 		}
 		summary.Observe(duration)
 		histogram.Observe(duration)
@@ -122,13 +125,13 @@ func (h *SubRefreshHandler) Handle() SubRefreshHandlerFunc {
 			log.Error().Msg("no sub refresh result found")
 			return centrifuge.SubRefreshReply{
 				Expired: true,
-			}, SubRefreshExtra{}, nil
+			}, SubRefreshExtra{Outcome: RefreshOutcomeNoResult}, nil
 		}
 
 		if result.Expired {
 			return centrifuge.SubRefreshReply{
 				Expired: true,
-			}, SubRefreshExtra{}, nil
+			}, SubRefreshExtra{Outcome: RefreshOutcomeBackendExpired}, nil
 		}
 
 		var info []byte
@@ -136,14 +139,14 @@ func (h *SubRefreshHandler) Handle() SubRefreshHandlerFunc {
 			decodedInfo, err := base64.StdEncoding.DecodeString(result.B64Info)
 			if err != nil {
 				log.Error().Err(err).Str("client", client.ID()).Msg("error decoding base64 info")
-				return centrifuge.SubRefreshReply{}, SubRefreshExtra{}, centrifuge.ErrorInternal
+				return centrifuge.SubRefreshReply{}, SubRefreshExtra{Outcome: RefreshOutcomeDecodeError}, centrifuge.ErrorInternal
 			}
 			info = decodedInfo
 		} else {
 			info = result.Info
 		}
 
-		extra := SubRefreshExtra{}
+		extra := SubRefreshExtra{Outcome: RefreshOutcomeBackendExpireAt}
 
 		return centrifuge.SubRefreshReply{
 			ExpireAt: result.ExpireAt,
