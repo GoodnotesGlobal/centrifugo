@@ -1,6 +1,6 @@
 name: Goodnotes refresh witness
 
-# Focused CI for the Goodnotes refresh-applied witness v1 on top of official v6.9.1.
+# Focused CI for the applied-state and timing witnesses on top of official v6.9.1.
 # Read-only: no secrets, no services, no image, no publish, no deploy. Its job name is the
 # stable check-run name a sparse Centrifugo closure lists under review.requiredChecks.
 on:
@@ -52,10 +52,10 @@ jobs:
           set -euo pipefail
           base=4603be29243501f4ac2787de17c4f0428b27864e # official v6.9.1
           git merge-base --is-ancestor "$base" HEAD
-          # Ours = every Go file changed since v6.9.1 outside the vendored SDK, plus the SDK additions.
+          # Ours = changed Go files outside the SDK, its additions, and its one reviewed modified file.
           # (Two calls: a pathspec exclude would also drop the SDK additions.)
           mapfile -t files < <({ git diff --name-only --diff-filter=ACMR "$base" HEAD -- '*.go' ':(exclude)third_party/**'
-                                 git diff --name-only --diff-filter=ACMR "$base" HEAD -- 'third_party/centrifuge/goodnotes_*.go'; })
+                                 git diff --name-only --diff-filter=ACMR "$base" HEAD -- 'third_party/centrifuge/goodnotes_*.go' 'third_party/centrifuge/client.go'; })
           test "${#files[@]}" -gt 0
           printf '%s\n' "${files[@]}"
           unformatted="$(gofmt -l "${files[@]}")"
@@ -93,21 +93,35 @@ jobs:
                    TestGoodnotesRefreshWitnessE2EClampShowsMismatch \
                    TestGoodnotesRefreshWitnessE2EExpiredAndDisconnectOnlyClose \
                    TestGoodnotesRefreshOutcomeTypesEveryHTTPBranch \
-                   TestGoodnotesSubRefreshOutcomeTypesEveryHTTPBranch; do
+                   TestGoodnotesSubRefreshOutcomeTypesEveryHTTPBranch \
+                   TestGoodnotesRefreshTimingLineIsClosedAndContentFree \
+                   TestGoodnotesRefreshTimingInstallIsOffByDefaultAndPanicSafe \
+                   TestGoodnotesRefreshTimingE2ENaturalChainJoinsAppliedWitness \
+                   TestGoodnotesRefreshTimingE2EGraceAndExpiredStayTyped \
+                   TestGoodnotesRefreshTimingDelayBoundsNeverOverflow \
+                   TestGoodnotesWitnessLinesInProductionLoggerFormat; do
             grep -q -- "--- PASS: $t " witness.log
           done
 
-      - name: Vendored SDK accessor tests with race detector
+      - name: Vendored SDK state and timing tests with race detector
         working-directory: third_party/centrifuge
         env:
           CGO_ENABLED: '1'
         run: |
           set -euo pipefail
-          go test -race -count=1 -run '^TestApplied(Refresh|Subscription)State' -v . | tee ../../sdk.log
+          go test -race -count=1 -run '^(TestApplied(Refresh|Subscription)State|TestGoodnotesTiming)' -v . | tee ../../sdk.log
           for t in TestAppliedRefreshStateReflectsConnectExpiration \
                    TestAppliedRefreshStateAfterServerSideRefreshApplied \
                    TestAppliedRefreshStateAfterExpiredRefreshIsClosed \
                    TestAppliedRefreshStateAfterHandlerErrorIsClosed \
-                   TestAppliedSubscriptionStateReadsTheRenewedChannelExpiration; do
+                   TestAppliedSubscriptionStateReadsTheRenewedChannelExpiration \
+                   TestGoodnotesTimingNaturalChainThroughRealTimer \
+                   TestGoodnotesTimingNotAppliedBranchesKeepUpstreamBehaviour \
+                   TestGoodnotesTimingEarlyOverwrittenAndNonTimerAreDistinguishable \
+                   TestGoodnotesTimingOriginsStayDistinct \
+                   TestGoodnotesTimingSubscriptionStrictPredicateAndCopiedState \
+                   TestGoodnotesTimingSinkFullClosedOrNilNeverChangesBehaviour \
+                   TestGoodnotesTimingNoSinkKeepsStateSeqButEmitsNothing \
+                   TestGoodnotesTimingClosedSinkDropsSurfaceThroughAReplacementSink; do
             grep -q -- "--- PASS: $t " ../../sdk.log
           done
